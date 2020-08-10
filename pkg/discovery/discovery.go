@@ -23,6 +23,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/sig-storage-local-static-provisioner/pkg/metrics"
 
 	v1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	storagev1listers "k8s.io/client-go/listers/storage/v1"
 	"k8s.io/client-go/tools/cache"
@@ -79,11 +81,41 @@ func (d *readyzCheck) Name() string {
 func NewDiscoverer(config *common.RuntimeConfig, cleanupTracker *deleter.CleanupStatusTracker) (*Discoverer, error) {
 	sharedInformer := config.InformerFactory.Storage().V1().StorageClasses()
 	sharedInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		// We don't need an actual event handler for StorageClasses,
-		// but we must pass a non-nil one to cache.NewInformer()
-		AddFunc:    nil,
-		UpdateFunc: nil,
-		DeleteFunc: nil,
+		AddFunc: func(obj interface{}) {
+			sc, ok := obj.(*storagev1.StorageClass)
+			if !ok {
+				klog.Errorf("Added object is not a storagev1.StorageClass type")
+				return
+			}
+
+			if mountConfig := getMountConfigFromStorageClass(sc); mountConfig != nil {
+				klog.Infof("Discover a new storageclass %s/%s", config.Namespace, sc.Name)
+				config.DiscoveryMap[sc.Name] = *mountConfig
+			}
+		},
+
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			newSC, ok := newObj.(*storagev1.StorageClass)
+			if !ok {
+				klog.Errorf("Updated object is not a storagev1.StorageClass type")
+				return
+			}
+
+			if mountConfig := getMountConfigFromStorageClass(newSC); mountConfig != nil {
+				klog.Infof("Discover a update storageclass %s/%s", config.Namespace, newSC.Name)
+				config.DiscoveryMap[newSC.Name] = *mountConfig
+			}
+		},
+
+		DeleteFunc: func(obj interface{}) {
+			sc, ok := obj.(*storagev1.StorageClass)
+			if !ok {
+				klog.Errorf("Added object is not a storagev1.StorageClass type")
+				return
+			}
+
+			delete(config.DiscoveryMap, sc.Name)
+		},
 	})
 
 	labelMap := make(map[string]string)
@@ -274,6 +306,9 @@ func (d *Discoverer) discoverVolumesAtPath(class string, config common.MountConf
 	for _, mp := range mountPoints {
 		mountPointMap[mp.Path] = empty{}
 	}
+
+	// Set default storageclass lable
+	d.Labels[common.DefaultStorageClassLable] = class
 
 	var discoErrors []error
 	var totalCapacityBlockBytes, totalCapacityFSBytes int64
@@ -475,4 +510,46 @@ func StorageNodeAffinityToAlphaAnnotation(annotations map[string]string, affinit
 	}
 	annotations[common.AlphaStorageNodeAffinityAnnotation] = string(json)
 	return nil
+}
+
+func getMountConfigFromStorageClass(sc *storagev1.StorageClass) *common.MountConfig {
+	if sc.Labels == nil || sc.Parameters == nil || sc.Labels["system/storageType"] != "local" {
+		return nil
+	}
+
+	mountDir := sc.Parameters["mountDir"]
+	if mountDir == "" {
+		klog.Errorf("Storage Class %v is misconfigured, missing HostDir or MountDir parameter", sc.Name)
+		return nil
+	}
+
+	mountConfig := &common.MountConfig{
+		HostDir:  mountDir,
+		MountDir: mountDir,
+	}
+
+	if blockCleanerCommand := sc.Parameters["blockCleanerCommand"]; blockCleanerCommand != "" {
+		mountConfig.BlockCleanerCommand = strings.Split(blockCleanerCommand, " ")
+	} else {
+		mountConfig.BlockCleanerCommand = []string{common.DefaultBlockCleanerCommand}
+
+	}
+
+	if volumeMode := sc.Parameters["volumeMode"]; volumeMode != "" {
+		mountConfig.VolumeMode = volumeMode
+	} else {
+		mountConfig.VolumeMode = common.DefaultVolumeMode
+	}
+
+	if namePattern := sc.Parameters["namePattern"]; namePattern == "" {
+		mountConfig.NamePattern = common.DefaultNamePattern
+	}
+
+	if fsType := sc.Parameters["fsType"]; fsType != "" {
+		mountConfig.FsType = fsType
+	} else {
+		mountConfig.FsType = "ext4"
+	}
+
+	return mountConfig
 }

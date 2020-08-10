@@ -84,6 +84,9 @@ const (
 
 	// DefaultNamePattern is the default name pattern of in PV discovery.
 	DefaultNamePattern = "*"
+
+	// DefaultStorageClassLable is the default name of storageclass lable
+	DefaultStorageClassLable = "system/storageclass"
 )
 
 // UserConfig stores all the user-defined parameters to the provisioner
